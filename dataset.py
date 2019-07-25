@@ -48,4 +48,5 @@ class LMDBDataset(Dataset):
 
             row = pickle.loads(txn.get(key))
 
-        return torch.from_numpy(row.top), torch.from_numpy(row.bottom), row.filename
+        return [torch.from_numpy(r) for r in row]
+

@@ -21,31 +21,34 @@ def train(args, epoch, loader, model, optimizer, scheduler, device):
     loader = tqdm(loader)
 
     criterion = nn.CrossEntropyLoss()
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
 
-    for i, (top, bottom, label) in enumerate(loader):
+    for i, codes in enumerate(loader):
         model.zero_grad()
 
-        top = top.to(device)
-
-        if args.hier == 'top':
-            target = top
-            out, _ = model(top)
-
-        elif args.hier == 'bottom':
-            bottom = bottom.to(device)
+        if args.hier == 0:
+            target = codes[0].cuda()
+            loss, acc = model(target)
+        else:
+            codes = [c.cuda() for c in codes[args.hier-1:args.hier]]
+            top = codes[0]
+            bottom = codes[1]
             target = bottom
-            out, _ = model(bottom, condition=top)
-
-        loss = criterion(out, target)
+            loss, acc = model(bottom, condition=top)
+        loss = loss.mean()
+        accuracy = acc.mean().item()
+        #loss = criterion(out, target)
         loss.backward()
 
         if scheduler is not None:
             scheduler.step()
         optimizer.step()
 
-        _, pred = out.max(1)
-        correct = (pred == target).float()
-        accuracy = correct.sum() / target.numel()
+        #_, pred = out.max(1)
+        #correct = (pred == target).float()
+        #accuracy = correct.sum() / target.numel()
 
         lr = optimizer.param_groups[0]['lr']
 
@@ -71,14 +74,14 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch', type=int, default=32)
     parser.add_argument('--epoch', type=int, default=420)
-    parser.add_argument('--hier', type=str, default='top')
+    parser.add_argument('--hier', type=int, default=0)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--channel', type=int, default=256)
     parser.add_argument('--n_res_block', type=int, default=4)
     parser.add_argument('--n_res_channel', type=int, default=256)
     parser.add_argument('--n_out_res_block', type=int, default=0)
     parser.add_argument('--n_cond_res_block', type=int, default=3)
-    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--dropout', type=float, default=0.5)
     parser.add_argument('--amp', type=str, default='O0')
     parser.add_argument('--sched', type=str)
     parser.add_argument('--ckpt', type=str)
@@ -88,7 +91,7 @@ if __name__ == '__main__':
 
     print(args)
 
-    device = 'cuda'
+    device = 'cuda:0'
 
     dataset = LMDBDataset(args.path)
     loader = DataLoader(
@@ -101,9 +104,9 @@ if __name__ == '__main__':
         ckpt = torch.load(args.ckpt)
         args = ckpt['args']
 
-    if args.hier == 'top':
+    if args.hier == 0:
         model = PixelSNAIL(
-            [32, 32],
+            [16, 16],
             512,
             args.channel,
             5,
@@ -114,9 +117,11 @@ if __name__ == '__main__':
             n_out_res_block=args.n_out_res_block,
         )
 
-    elif args.hier == 'bottom':
+    else:
+        size = 16 * (2 ** args.hier)
+        print(size)
         model = PixelSNAIL(
-            [64, 64],
+            [size, size],
             512,
             args.channel,
             5,
@@ -131,15 +136,17 @@ if __name__ == '__main__':
 
     if 'model' in ckpt:
         model.load_state_dict(ckpt['model'])
+    ckpt = None
 
-    model = model.to(device)
+
+    model = model.cuda()#to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    if amp is not None:
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.amp)
+    #if amp is not None:
+    #    model, optimizer = amp.initialize(model, optimizer)
 
     model = nn.DataParallel(model)
-    model = model.to(device)
+    #model = model.to(device)
 
     scheduler = None
     if args.sched == 'cycle':

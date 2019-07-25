@@ -17,20 +17,21 @@ def extract(lmdb_env, loader, model, device):
     with lmdb_env.begin(write=True) as txn:
         pbar = tqdm(loader)
 
+        sss = 0 
+
         for img, _, filename in pbar:
             img = img.to(device)
 
-            _, _, _, id_t, id_b = model.encode(img)
-            id_t = id_t.detach().cpu().numpy()
-            id_b = id_b.detach().cpu().numpy()
+            _, _, indexes = model(img)
+            indexes = [f.data.cpu().numpy() for f in indexes]
 
-            for file, top, bottom in zip(filename, id_t, id_b):
-                row = CodeRow(top=top, bottom=bottom, filename=file)
-                txn.put(str(index).encode('utf-8'), pickle.dumps(row))
-                index += 1
-                pbar.set_description(f'inserted: {index}')
+            for i, file in enumerate(filename):
+                index = [f[i] for f in indexes]
+                txn.put(str(sss).encode('utf-8'), pickle.dumps(index))
+                pbar.set_description(f'inserted: {sss}')
+                sss += 1
 
-        txn.put('length'.encode('utf-8'), str(index).encode('utf-8'))
+        txn.put('length'.encode('utf-8'), str(sss).encode('utf-8'))
 
 
 if __name__ == '__main__':
@@ -54,12 +55,14 @@ if __name__ == '__main__':
     )
 
     dataset = ImageFileDataset(args.path, transform=transform)
-    loader = DataLoader(dataset, batch_size=128, shuffle=False, num_workers=4)
+    loader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=8)
 
     model = VQVAE()
     model.load_state_dict(torch.load(args.ckpt))
     model = model.to(device)
+    model.forward = model.encode
     model.eval()
+    #model = torch.nn.DataParallel(model)
 
     map_size = 100 * 1024 * 1024 * 1024
 

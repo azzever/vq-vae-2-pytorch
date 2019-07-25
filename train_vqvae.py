@@ -4,6 +4,11 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 
+try:
+    from apex import amp
+except ImportError:
+    amp = None
+
 from torchvision import datasets, transforms, utils
 
 from tqdm import tqdm
@@ -28,8 +33,8 @@ def train(epoch, loader, model, optimizer, scheduler, device):
 
         img = img.to(device)
 
-        out, latent_loss = model(img)
-        recon_loss = criterion(out, img)
+        recon_loss, latent_loss = model(img)
+        recon_loss = recon_loss.mean()
         latent_loss = latent_loss.mean()
         loss = recon_loss + latent_loss_weight * latent_loss
         loss.backward()
@@ -57,7 +62,7 @@ def train(epoch, loader, model, optimizer, scheduler, device):
             sample = img[:sample_size]
 
             with torch.no_grad():
-                out, _ = model(sample)
+                out = model.module(sample)
 
             utils.save_image(
                 torch.cat([sample, out], 0),
@@ -75,6 +80,7 @@ if __name__ == '__main__':
     parser.add_argument('--size', type=int, default=256)
     parser.add_argument('--epoch', type=int, default=560)
     parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--amp', type=str, default='O0')
     parser.add_argument('--sched', type=str)
     parser.add_argument('path', type=str)
 
@@ -94,16 +100,18 @@ if __name__ == '__main__':
     )
 
     dataset = datasets.ImageFolder(args.path, transform=transform)
-    loader = DataLoader(dataset, batch_size=128, shuffle=True, num_workers=4)
+    loader = DataLoader(dataset, batch_size=66, shuffle=True, num_workers=12)
 
-    model = nn.DataParallel(VQVAE()).to(device)
+    model = VQVAE().to(device)
+    
 
+    #if amp is not None:
+    #    model, optimizer = amp.initialize(model, optimizer)#, opt_level=args.amp)
+    model.load_state_dict(torch.load("checkpoint/vqvae_014.pt"))
+    model = nn.DataParallel(model).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
     scheduler = None
-    if args.sched == 'cycle':
-        scheduler = CycleScheduler(
-            optimizer, args.lr, n_iter=len(loader) * args.epoch, momentum=None
-        )
 
     for i in range(args.epoch):
         train(i, loader, model, optimizer, scheduler, device)

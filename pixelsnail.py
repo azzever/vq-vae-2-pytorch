@@ -32,7 +32,7 @@ class WNConv2d(nn.Module):
         super().__init__()
 
         self.conv = nn.utils.weight_norm(
-            nn.Conv2d(
+           nn.Conv2d(
                 in_channel,
                 out_channel,
                 kernel_size,
@@ -393,8 +393,10 @@ class PixelSNAIL(nn.Module):
         out.extend([nn.ELU(inplace=True), WNConv2d(channel, n_class, 1)])
 
         self.out = nn.Sequential(*out)
+        self.criterion = nn.CrossEntropyLoss()
 
     def forward(self, input, condition=None, cache=None):
+        input_or = input
         if cache is None:
             cache = {}
         batch, height, width = input.shape
@@ -427,5 +429,9 @@ class PixelSNAIL(nn.Module):
             out = block(out, background, condition=condition)
 
         out = self.out(out)
-
-        return out, cache
+        if self.training:
+            pred = out.max(1)[1]
+            correct = (pred == input_or).type_as(out)
+            accuracy = correct.sum() / input_or.numel()
+            return self.criterion(out, input_or).unsqueeze(0), accuracy.unsqueeze(0)
+        return out#, cache

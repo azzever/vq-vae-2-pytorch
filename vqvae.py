@@ -37,6 +37,8 @@ class Quantize(nn.Module):
         self.register_buffer('embed_avg', embed.clone())
 
     def forward(self, input):
+        input = input.permute(0, 2, 3, 1)
+        oririnal_size = input.shape
         flatten = input.reshape(-1, self.dim)
         dist = (
             flatten.pow(2).sum(1, keepdim=True)
@@ -49,6 +51,7 @@ class Quantize(nn.Module):
         quantize = self.embed_code(embed_ind)
 
         if self.training:
+            print("updating")
             self.cluster_size.data.mul_(self.decay).add_(
                 1 - self.decay, embed_onehot.sum(0)
             )
@@ -64,7 +67,7 @@ class Quantize(nn.Module):
         diff = (quantize.detach() - input).pow(2).mean()
         quantize = input + (quantize - input).detach()
 
-        return quantize, diff, embed_ind
+        return quantize.permute(0, 3, 1, 2), diff, embed_ind
 
     def embed_code(self, embed_id):
         return F.embedding(embed_id, self.embed.transpose(0, 1))
@@ -78,7 +81,7 @@ class ResBlock(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(in_channel, channel, 3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channel, in_channel, 1),
+            nn.Conv2d(channel, in_channel, 3, padding=1),
         )
 
     def forward(self, input):
@@ -99,6 +102,15 @@ class Encoder(nn.Module):
                 nn.Conv2d(channel // 2, channel, 4, stride=2, padding=1),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(channel, channel, 3, padding=1),
+            ]
+        
+        if stride == 8:
+            blocks = [
+                nn.Conv2d(in_channel, channel // 4, 4, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channel // 4, channel // 2, 4, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channel // 2, channel, 4, stride=2, padding=1),
             ]
 
         elif stride == 2:
@@ -142,6 +154,18 @@ class Decoder(nn.Module):
                     ),
                 ]
             )
+        
+        if stride == 8:
+            blocks.extend(
+                [
+                    nn.ConvTranspose2d(channel, channel // 2, 4, stride=2, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.ConvTranspose2d(channel // 2,  channel // 4, 4, stride=2, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.ConvTranspose2d(channel // 4,  out_channel, 4, stride=2, padding=1),
+                    
+                ]
+            )
 
         elif stride == 2:
             blocks.append(
@@ -167,58 +191,106 @@ class VQVAE(nn.Module):
     ):
         super().__init__()
 
-        self.enc_b = Encoder(in_channel, channel, n_res_block, n_res_channel, stride=4)
-        self.enc_t = Encoder(channel, channel, n_res_block, n_res_channel, stride=2)
-        self.quantize_conv_t = nn.Conv2d(channel, embed_dim, 1)
-        self.quantize_t = Quantize(embed_dim, n_embed)
-        self.dec_t = Decoder(
-            embed_dim, embed_dim, channel, n_res_block, n_res_channel, stride=2
-        )
-        self.quantize_conv_b = nn.Conv2d(embed_dim + channel, embed_dim, 1)
-        self.quantize_b = Quantize(embed_dim, n_embed)
-        self.upsample_t = nn.ConvTranspose2d(
-            embed_dim, embed_dim, 4, stride=2, padding=1
-        )
-        self.dec = Decoder(
-            embed_dim + embed_dim,
-            in_channel,
-            channel,
-            n_res_block,
-            n_res_channel,
-            stride=4,
-        )
+        self.enc = nn.ModuleList()
+        self.enc.append(Encoder(in_channel, channel, n_res_block, n_res_channel, stride=8)) # 128
+        self.enc.append(Encoder(channel, channel, n_res_block, n_res_channel, stride=2)) # 64
+        self.enc.append(Encoder(channel, channel, n_res_block, n_res_channel, stride=2)) # 32
+        self.enc.append(Encoder(channel, channel, n_res_block, n_res_channel, stride=2)) # 16
+        
+        self.quantize_proj = nn.ModuleList()
+        self.quantize_proj.append(nn.Conv2d(channel, embed_dim, 1)) # 16
+        self.quantize_proj.append(nn.Conv2d(channel * 2, embed_dim, 1)) # 32
+        self.quantize_proj.append(nn.Conv2d(channel * 2, embed_dim, 1)) # 64
+        self.quantize_proj.append(nn.Conv2d(channel * 2, embed_dim, 1)) # 128
+        
+        self.quantize = nn.ModuleList()
+        self.quantize.append(Quantize(embed_dim, n_embed))
+        self.quantize.append(Quantize(embed_dim, n_embed))
+        self.quantize.append(Quantize(embed_dim, n_embed))
+        self.quantize.append(Quantize(embed_dim, n_embed))
+        
+        self.upsample_proj = nn.ModuleList()
+        self.upsample_proj.append(nn.ConvTranspose2d(embed_dim, channel, 4, stride=2, padding=1))
+        self.upsample_proj.append(nn.ConvTranspose2d(embed_dim, channel, 4, stride=2, padding=1))
+        self.upsample_proj.append(nn.ConvTranspose2d(embed_dim, channel, 4, stride=2, padding=1))
+        
+        self.dec = nn.ModuleList()
+        self.dec.append(Decoder(embed_dim, embed_dim, channel, n_res_block, n_res_channel, stride=2)) # 16 -> 32
+        self.dec.append(Decoder(embed_dim, embed_dim, channel, n_res_block, n_res_channel, stride=2)) # 32 -> 64
+        self.dec.append(Decoder(embed_dim, embed_dim, channel, n_res_block, n_res_channel, stride=2)) # 64 -> 128
+        self.dec.append(Decoder(embed_dim, embed_dim, channel, n_res_block, n_res_channel, stride=2)) # 128 -> 256 
+
+        self.to_rgb = nn.ModuleList()
+        for i in range(0, 4):
+            self.to_rgb.append(
+                nn.Sequential(
+                    nn.ReLU(inplace=True),
+                    nn.ConvTranspose2d(embed_dim, embed_dim // 2, 4, stride=2, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.ConvTranspose2d(embed_dim // 2, 3, 4, stride=2, padding=1)))
+        self.criterion = nn.MSELoss()
+        self.latent_loss_weight = 0.25
 
     def forward(self, input):
-        quant_t, quant_b, diff, _, _ = self.encode(input)
-        dec = self.decode(quant_t, quant_b)
+        quant, diff, _ = self.encode(input)
+        
+        dec = self.decode(quant)
+        if self.training:
+            loss_img = 0
+            for img in dec:
+                loss_img += self.criterion(img, F.interpolate(input, size=(img.shape[2], img.shape[3]), mode='area'))
+            loss_img /= len(dec)
 
-        return dec, diff
+            return loss_img.unsqueeze(0), diff
+        else:
+            return dec[-1]
 
     def encode(self, input):
-        enc_b = self.enc_b(input)
-        enc_t = self.enc_t(enc_b)
+        
+        enc1 = self.enc[0](input)
+        enc2 = self.enc[1](enc1)
+        enc3 = self.enc[2](enc2)
+        enc4 = self.enc[3](enc3)
+        
+        proj_to_quantize_4 = self.quantize_proj[0](enc4)
+        quant_4, diff_t_4, id_t_4 = self.quantize[0](proj_to_quantize_4)
+        
+        up_from_quant_4 = F.relu(self.upsample_proj[0](quant_4), inplace=True)
+        
+        proj_to_quantize_3 = self.quantize_proj[1](torch.cat([enc3, up_from_quant_4], 1))
+        quant_3, diff_t_3, id_t_3 = self.quantize[1](proj_to_quantize_3)
+        
+        up_from_quant_3 = F.relu(self.upsample_proj[1](quant_3), inplace=True)
+        
+        proj_to_quantize_2 = self.quantize_proj[2](torch.cat([enc2, up_from_quant_3], 1))
+        quant_2, diff_t_2, id_t_2 = self.quantize[2](proj_to_quantize_2)
+        
+        up_from_quant_2 = F.relu(self.upsample_proj[2](quant_2), inplace=True)
+        
+        proj_to_quantize_1 = self.quantize_proj[3](torch.cat([enc1, up_from_quant_2], 1))
+        quant_1, diff_t_1, id_t_1 = self.quantize[3](proj_to_quantize_1)
+        
+        
+        diff = diff_t_4 + diff_t_3 + diff_t_2 + diff_t_1
+        diff = diff.unsqueeze(0)
 
-        quant_t = self.quantize_conv_t(enc_t).permute(0, 2, 3, 1)
-        quant_t, diff_t, id_t = self.quantize_t(quant_t)
-        quant_t = quant_t.permute(0, 3, 1, 2)
-        diff_t = diff_t.unsqueeze(0)
+        return [quant_4, quant_3, quant_2, quant_1], diff, [id_t_4, id_t_3, id_t_2, id_t_1]
 
-        dec_t = self.dec_t(quant_t)
-        enc_b = torch.cat([dec_t, enc_b], 1)
-
-        quant_b = self.quantize_conv_b(enc_b).permute(0, 2, 3, 1)
-        quant_b, diff_b, id_b = self.quantize_b(quant_b)
-        quant_b = quant_b.permute(0, 3, 1, 2)
-        diff_b = diff_b.unsqueeze(0)
-
-        return quant_t, quant_b, diff_t + diff_b, id_t, id_b
-
-    def decode(self, quant_t, quant_b):
-        upsample_t = self.upsample_t(quant_t)
-        quant = torch.cat([upsample_t, quant_b], 1)
-        dec = self.dec(quant)
-
-        return dec
+    def decode(self, quant):
+        dec = self.dec[0](quant[0])
+        rgbs = []
+        rgb = self.to_rgb[0](dec)
+        rgbs.append(rgb)
+        dec = self.dec[1](dec + quant[1])
+        rgb = F.upsample(rgb, scale_factor=2) + self.to_rgb[1](dec)
+        rgbs.append(rgb)
+        dec = self.dec[2](dec + quant[2])
+        rgb = F.upsample(rgb, scale_factor=2) + self.to_rgb[2](dec)
+        rgbs.append(rgb)
+        dec = self.dec[3](dec + quant[3])
+        rgb = F.upsample(rgb, scale_factor=2) + self.to_rgb[3](dec)
+        rgbs.append(rgb)
+        return rgbs 
 
     def decode_code(self, code_t, code_b):
         quant_t = self.quantize_t.embed_code(code_t)
